@@ -9,3 +9,7 @@ run `cargo run -- -n 2` in one console, and commands like `while true; do; sleep
 While number of conncurrent connections lower then 2 (value of `-n` option), every connection will succeed. But if number of connections exceed -n value you will see error messages in console and new connecton will be aborted.
 
 ![screenshot](https://github.com/ikod/testo/blob/main/img/screen2.svg?raw=true)
+
+State machine:
+
+![state machine](https://github.com/ikod/testo/blob/main/acceptor_fsm.svg?raw=true)
