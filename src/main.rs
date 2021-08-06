@@ -158,7 +158,10 @@ async fn run(task_pool: usize) -> Result<(), Report> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args();
+
     let task_pool = args.value_of("task_pool").unwrap_or("64").parse()?;
+    let workers = args.value_of("workers").unwrap_or("4").parse()?;
+
     if env::var("RUST_LOG").is_err() {
         env::set_var(
             "RUST_LOG",
@@ -176,7 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(2)
+        .worker_threads(workers)
         .build()?
         .block_on(run(task_pool))?;
     Ok(())
