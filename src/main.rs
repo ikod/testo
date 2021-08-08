@@ -3,7 +3,6 @@ use futures::{
     task::{Context, Poll},
     Future,
 };
-use log;
 use std::env;
 use std::{
     error::Error, fmt, io, net::SocketAddr, pin::Pin, result::Result, sync::Arc, time::Duration,
@@ -12,14 +11,15 @@ use testo::parse_args;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    select,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::sleep,
 };
 use tokio_util::sync::PollSemaphore;
-use tracing::debug;
+use tracing::{debug, instrument};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum State {
     AcceptConnections,
     WaitForTaskCompletion,
@@ -30,18 +30,20 @@ struct MyFut<'a> {
     listener: &'a TcpListener,
     accept_poll: Pin<Box<dyn Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a>>,
     semaphore_poll: PollSemaphore,
+    stop_after: usize,
 }
 
 impl<'a> MyFut<'a> {
-    fn new(listener: &'a TcpListener, pool_size: usize) -> Self {
+    fn new(listener: &'a TcpListener, pool_size: usize, stop_after: usize) -> Self {
         let accept_poll = Box::pin(listener.accept());
         let semaphore = Arc::new(Semaphore::new(pool_size));
-        let semaphore_poll = PollSemaphore::new(semaphore.clone());
+        let semaphore_poll = PollSemaphore::new(semaphore);
         MyFut {
             state: State::AcceptConnections,
             listener,
             accept_poll,
             semaphore_poll,
+            stop_after,
         }
     }
     fn spawn_handler(&mut self, s: TcpStream, permit: OwnedSemaphorePermit) -> JoinHandle<()> {
@@ -58,7 +60,8 @@ impl<'a> MyFut<'a> {
 
 #[derive(Debug)]
 enum PollRes {
-    E,
+    S, // Success
+    E, // Error
 }
 
 async fn handler(s: TcpStream) {
@@ -80,6 +83,9 @@ impl<'a> Future for MyFut<'a> {
     type Output = PollRes;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if this.stop_after == 0 {
+            return Poll::Ready(PollRes::S);
+        }
         loop {
             match this.state {
                 State::AcceptConnections => match this.accept_poll.as_mut().poll(cx) {
@@ -88,6 +94,7 @@ impl<'a> Future for MyFut<'a> {
                         this.accept_poll = Box::pin(this.listener.accept());
                         match this.semaphore_poll.clone_inner().try_acquire_owned() {
                             Ok(permit) => {
+                                this.stop_after -= 1;
                                 debug!(message="try_acquire ok", available_permits=?this.semaphore_poll.available_permits());
                                 this.spawn_handler(s, permit);
                             }
@@ -148,11 +155,55 @@ impl<'a> Future for MyFut<'a> {
     }
 }
 
-async fn run(task_pool: usize) -> Result<(), Report> {
+#[instrument]
+async fn run(task_pool: usize, stop_after: usize) -> Result<(), Report> {
     let listener = Arc::new(TcpListener::bind("127.0.0.1:9000").await.unwrap());
-    let mf = MyFut::new(&listener, task_pool);
+    let mf = MyFut::new(&listener, task_pool, stop_after);
     let x = mf.await;
     log::info!("{:?}", x);
+    drop(listener);
+
+    let listener = TcpListener::bind("127.0.0.1:9000").await?;
+    let semaphore = Arc::new(Semaphore::new(task_pool));
+    let mut stop_after = stop_after;
+    let mut state = State::AcceptConnections;
+    while stop_after > 0 {
+        let accept = listener.accept();
+        let acquire = semaphore.acquire();
+        if state == State::WaitForTaskCompletion {
+            select! {
+                _ = acquire => {
+                    state = State::AcceptConnections;
+                    debug!("reenable connections");
+                },
+                Ok((s, _a)) = accept => {
+                    log::error!("drop connection");
+                    drop(s);
+                }
+            }
+        } else if state == State::AcceptConnections {
+            select! {
+                Ok((s, _a)) = accept => {
+                    stop_after -= 1;
+                    if semaphore.available_permits() == 0 {
+                        log::error!("drop connection");
+                        drop(s);
+                        debug!("disable connections");
+                        state = State::WaitForTaskCompletion;
+                        continue;
+                    }
+                    let se  = semaphore.clone();
+                    tokio::spawn(async move {
+                        let permit = se.try_acquire();
+                        handler(s).await;
+                        drop(permit);
+                    });
+                }
+            }
+        } else {
+            todo!("unknown state")
+        }
+    }
     Ok(())
 }
 
@@ -161,6 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let task_pool = args.value_of("task_pool").unwrap_or("64").parse()?;
     let workers = args.value_of("workers").unwrap_or("4").parse()?;
+    let stop_after = args.value_of("stop_after").unwrap_or("100").parse()?;
 
     if env::var("RUST_LOG").is_err() {
         env::set_var(
@@ -181,6 +233,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .worker_threads(workers)
         .build()?
-        .block_on(run(task_pool))?;
+        .block_on(run(task_pool, stop_after))?;
     Ok(())
 }

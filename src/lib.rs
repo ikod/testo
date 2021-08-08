@@ -23,6 +23,13 @@ pub fn parse_args() -> ArgMatches {
                 .about("log level")
                 .short('l'),
         )
+        .arg(
+            Arg::new("stop_after")
+                .default_value("100")
+                .required(false)
+                .about("stop after that num of processed requests")
+                .short('s'),
+        )
         .get_matches();
     args
 }
